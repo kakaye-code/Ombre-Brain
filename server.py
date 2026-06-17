@@ -1361,6 +1361,33 @@ def _scan_bucket_issues(bucket: dict) -> list[str]:
     return issues
 
 
+def _api_ready(kind: str = "dehydration") -> str | None:
+    if kind == "embedding":
+        if not getattr(embedding_engine, "enabled", False):
+            return "embedding is disabled or missing API key"
+        return None
+    if not getattr(dehydrator, "api_available", False):
+        return "dehydration API is unavailable; configure OMBRE_API_KEY first"
+    return None
+
+
+def _parse_limit(request, default=20, maximum=100) -> int:
+    try:
+        raw = request.query_params.get("limit", str(default))
+        return max(1, min(maximum, int(raw)))
+    except Exception:
+        return default
+
+
+def _bucket_brief(bucket: dict) -> dict:
+    meta = bucket.get("metadata", {})
+    return {
+        "id": bucket["id"],
+        "name": meta.get("name", bucket["id"]),
+        "type": meta.get("type", "dynamic"),
+    }
+
+
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
@@ -1624,6 +1651,157 @@ async def api_maintenance_normalize(request):
             if ok:
                 changed.append({"id": bucket["id"], "updated": list(updates.keys())})
     return JSONResponse({"ok": True, "changed": changed, "count": len(changed)})
+
+
+@mcp.custom_route("/api/maintenance/backfill-embeddings", methods=["POST"])
+async def api_maintenance_backfill_embeddings(request):
+    """Generate embeddings for buckets missing them."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    ready_error = _api_ready("embedding")
+    if ready_error:
+        return JSONResponse({"error": ready_error}, status_code=400)
+    limit = _parse_limit(request, default=20, maximum=100)
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    processed = []
+    skipped = 0
+    errors = []
+    for bucket in buckets:
+        if len(processed) >= limit:
+            break
+        try:
+            existing = await embedding_engine.get_embedding(bucket["id"])
+            if existing is not None:
+                skipped += 1
+                continue
+            ok = await embedding_engine.generate_and_store(bucket["id"], bucket.get("content", ""))
+            if ok:
+                processed.append(_bucket_brief(bucket))
+            else:
+                errors.append({"id": bucket["id"], "error": "embedding generation returned false"})
+        except Exception as e:
+            errors.append({"id": bucket["id"], "error": str(e)})
+    return JSONResponse({
+        "ok": True,
+        "processed": processed,
+        "processed_count": len(processed),
+        "skipped_existing": skipped,
+        "errors": errors,
+        "limit": limit,
+    })
+
+
+@mcp.custom_route("/api/maintenance/fill-dehydration-cache", methods=["POST"])
+async def api_maintenance_fill_dehydration_cache(request):
+    """Create dehydration cache entries for long buckets that do not have one."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    ready_error = _api_ready("dehydration")
+    if ready_error:
+        return JSONResponse({"error": ready_error}, status_code=400)
+    limit = _parse_limit(request, default=20, maximum=100)
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    processed = []
+    skipped_short = 0
+    skipped_cached = 0
+    errors = []
+    for bucket in buckets:
+        if len(processed) >= limit:
+            break
+        content = bucket.get("content", "")
+        if count_tokens_approx(content) < 100:
+            skipped_short += 1
+            continue
+        try:
+            if dehydrator._get_cached_summary(content):
+                skipped_cached += 1
+                continue
+            await dehydrator.dehydrate(content, bucket.get("metadata", {}))
+            processed.append(_bucket_brief(bucket))
+        except Exception as e:
+            errors.append({"id": bucket["id"], "error": str(e)})
+    return JSONResponse({
+        "ok": True,
+        "processed": processed,
+        "processed_count": len(processed),
+        "skipped_short": skipped_short,
+        "skipped_cached": skipped_cached,
+        "errors": errors,
+        "limit": limit,
+    })
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/redehydrate", methods=["POST"])
+async def api_bucket_redehydrate(request):
+    """Invalidate and rebuild one bucket's dehydration cache, returning a preview."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    ready_error = _api_ready("dehydration")
+    if ready_error:
+        return JSONResponse({"error": ready_error}, status_code=400)
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    content = bucket.get("content", "")
+    try:
+        dehydrator.invalidate_cache(content)
+        summary = await dehydrator.dehydrate(content, bucket.get("metadata", {}))
+        return JSONResponse({
+            "ok": True,
+            "bucket": _bucket_brief(bucket),
+            "summary": summary,
+            "tokens": count_tokens_approx(summary),
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/retag", methods=["POST"])
+async def api_bucket_retag(request):
+    """Run analyze() for one bucket. Apply only when apply=true."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    ready_error = _api_ready("dehydration")
+    if ready_error:
+        return JSONResponse({"error": ready_error}, status_code=400)
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    apply_changes = bool(body.get("apply", False))
+    try:
+        analysis = await dehydrator.analyze(bucket.get("content", ""))
+        updates = {
+            "domain": analysis.get("domain", ["未分类"]),
+            "tags": analysis.get("tags", []),
+            "valence": analysis.get("valence", 0.5),
+            "arousal": analysis.get("arousal", 0.3),
+        }
+        suggested_name = str(analysis.get("suggested_name", "")).strip()
+        if suggested_name:
+            updates["name"] = suggested_name
+        if apply_changes:
+            ok = await bucket_mgr.update(bucket_id, **updates)
+            if not ok:
+                return JSONResponse({"error": "update failed"}, status_code=500)
+        return JSONResponse({
+            "ok": True,
+            "applied": apply_changes,
+            "bucket": _bucket_brief(bucket),
+            "analysis": analysis,
+            "updates": updates,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @mcp.custom_route("/api/search", methods=["GET"])

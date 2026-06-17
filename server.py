@@ -43,6 +43,8 @@ import secrets
 import time
 import json as _json_lib
 import httpx
+import shutil
+import frontmatter
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -56,7 +58,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso, safe_path, sanitize_name
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -1263,6 +1265,102 @@ async def dream() -> str:
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
+def _safe_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _clamp_int(value, default=5, low=1, high=10):
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_float(value, default=0.5, low=0.0, high=1.0):
+    try:
+        return max(low, min(high, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _trash_dir():
+    path = os.path.join(config["buckets_dir"], "trash")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _find_trash_file(bucket_id: str) -> str | None:
+    if not bucket_id:
+        return None
+    trash = _trash_dir()
+    for root, _, files in os.walk(trash):
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            name_part = fname[:-3]
+            if name_part == bucket_id or name_part.endswith(f"_{bucket_id}"):
+                return os.path.join(root, fname)
+    return None
+
+
+def _bucket_to_api(b: dict) -> dict:
+    meta = b.get("metadata", {})
+    return {
+        "id": b["id"],
+        "name": meta.get("name", b["id"]),
+        "type": meta.get("type", "dynamic"),
+        "domain": meta.get("domain", []),
+        "tags": meta.get("tags", []),
+        "valence": meta.get("valence", 0.5),
+        "arousal": meta.get("arousal", 0.3),
+        "model_valence": meta.get("model_valence"),
+        "importance": meta.get("importance", 5),
+        "resolved": meta.get("resolved", False),
+        "pinned": meta.get("pinned", False),
+        "digested": meta.get("digested", False),
+        "deleted": meta.get("deleted", False),
+        "deleted_at": meta.get("deleted_at", ""),
+        "deleted_from": meta.get("deleted_from", ""),
+        "created": meta.get("created", ""),
+        "last_active": meta.get("last_active", ""),
+        "activation_count": meta.get("activation_count", 1),
+        "score": decay_engine.calculate_score(meta),
+        "content_preview": strip_wikilinks(b.get("content", ""))[:200],
+    }
+
+
+def _scan_bucket_issues(bucket: dict) -> list[str]:
+    meta = bucket.get("metadata", {})
+    issues = []
+    try:
+        imp = int(meta.get("importance", 5))
+        if imp < 1 or imp > 10:
+            issues.append("importance_out_of_range")
+    except (TypeError, ValueError):
+        issues.append("importance_invalid")
+    if meta.get("pinned") and meta.get("type") != "permanent":
+        issues.append("pinned_not_permanent")
+    if meta.get("type") == "permanent" and not meta.get("pinned"):
+        issues.append("permanent_not_pinned")
+    if not isinstance(meta.get("domain", []), list):
+        issues.append("domain_not_list")
+    if not isinstance(meta.get("tags", []), list):
+        issues.append("tags_not_list")
+    if not meta.get("name"):
+        issues.append("missing_name")
+    if not meta.get("created"):
+        issues.append("missing_created")
+    if not meta.get("last_active"):
+        issues.append("missing_last_active")
+    return issues
+
+
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
@@ -1316,6 +1414,216 @@ async def api_bucket_detail(request):
         "content": strip_wikilinks(bucket.get("content", "")),
         "score": decay_engine.calculate_score(meta),
     })
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["PATCH"])
+async def api_bucket_update(request):
+    """Update editable bucket metadata/content from the dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    meta = bucket.get("metadata", {})
+    updates = {}
+    if "name" in body:
+        updates["name"] = str(body.get("name") or "").strip() or bucket_id
+    if "domain" in body:
+        updates["domain"] = _safe_list(body.get("domain")) or ["未分类"]
+    if "tags" in body:
+        updates["tags"] = _safe_list(body.get("tags"))
+    if "valence" in body:
+        updates["valence"] = _clamp_float(body.get("valence"), meta.get("valence", 0.5))
+    if "arousal" in body:
+        updates["arousal"] = _clamp_float(body.get("arousal"), meta.get("arousal", 0.3))
+    if "importance" in body:
+        updates["importance"] = _clamp_int(body.get("importance"), meta.get("importance", 5))
+    if "resolved" in body:
+        updates["resolved"] = bool(body.get("resolved"))
+    if "pinned" in body:
+        updates["pinned"] = bool(body.get("pinned"))
+        if updates["pinned"]:
+            updates["importance"] = 10
+    if "digested" in body:
+        updates["digested"] = bool(body.get("digested"))
+    if "type" in body:
+        target_type = str(body.get("type") or "").strip()
+        if target_type in ("dynamic", "permanent", "archived", "feel"):
+            updates["type"] = target_type
+    if "content" in body:
+        updates["content"] = str(body.get("content") or "")
+
+    if updates.get("pinned") is False and updates.get("type", meta.get("type")) == "permanent":
+        updates["type"] = "dynamic"
+
+    if not updates:
+        return JSONResponse({"error": "no updates"}, status_code=400)
+
+    # Existing pinned buckets ignore importance updates, so unpin first when needed.
+    if meta.get("pinned") and updates.get("pinned") is False:
+        if not await bucket_mgr.update(bucket_id, pinned=False):
+            return JSONResponse({"error": "failed to unpin"}, status_code=500)
+        meta = (await bucket_mgr.get(bucket_id) or {}).get("metadata", {})
+
+    success = await bucket_mgr.update(bucket_id, **updates)
+    if not success:
+        return JSONResponse({"error": "update failed"}, status_code=500)
+    if "content" in updates:
+        try:
+            await embedding_engine.generate_and_store(bucket_id, updates["content"])
+        except Exception:
+            pass
+    bucket = await bucket_mgr.get(bucket_id)
+    return JSONResponse({"ok": True, "bucket": _bucket_to_api(bucket), "updated": list(updates.keys())})
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/trash", methods=["POST"])
+async def api_bucket_trash(request):
+    """Soft-delete a bucket by moving it to buckets/trash."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    file_path = bucket_mgr._find_bucket_file(bucket_id)
+    if not file_path:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        post = frontmatter.load(file_path)
+        post["deleted"] = True
+        post["deleted_at"] = now_iso()
+        post["deleted_from"] = post.get("type", "dynamic")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(frontmatter.dumps(post))
+        dest = safe_path(_trash_dir(), os.path.basename(file_path))
+        shutil.move(file_path, str(dest))
+        try:
+            embedding_engine.delete_embedding(bucket_id)
+        except Exception:
+            pass
+        return JSONResponse({"ok": True, "path": str(dest)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/trash", methods=["GET"])
+async def api_trash_list(request):
+    """List soft-deleted buckets."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    result = []
+    for root, _, files in os.walk(_trash_dir()):
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            bucket = bucket_mgr._load_bucket(os.path.join(root, fname))
+            if bucket:
+                result.append(_bucket_to_api(bucket))
+    result.sort(key=lambda x: x.get("last_active") or x.get("created") or "", reverse=True)
+    return JSONResponse(result)
+
+
+@mcp.custom_route("/api/trash/{bucket_id}/restore", methods=["POST"])
+async def api_trash_restore(request):
+    """Restore a soft-deleted bucket to its previous type folder."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    file_path = _find_trash_file(bucket_id)
+    if not file_path:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        post = frontmatter.load(file_path)
+        target_type = post.get("deleted_from") or post.get("type") or "dynamic"
+        if target_type not in ("dynamic", "permanent", "archived", "feel"):
+            target_type = "dynamic"
+        post["deleted"] = False
+        post["restored_at"] = now_iso()
+        post["type"] = target_type
+        post.metadata.pop("deleted_at", None)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(frontmatter.dumps(post))
+        target_dir = {
+            "dynamic": bucket_mgr.dynamic_dir,
+            "permanent": bucket_mgr.permanent_dir,
+            "archived": bucket_mgr.archive_dir,
+            "feel": bucket_mgr.feel_dir,
+        }[target_type]
+        domain = post.get("domain", ["未分类"])
+        primary_domain = sanitize_name(domain[0]) if isinstance(domain, list) and domain else "未分类"
+        dest_dir = os.path.join(target_dir, primary_domain)
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = safe_path(dest_dir, os.path.basename(file_path))
+        shutil.move(file_path, str(dest))
+        return JSONResponse({"ok": True, "path": str(dest)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/maintenance/scan", methods=["GET"])
+async def api_maintenance_scan(request):
+    """Scan buckets for suspicious metadata."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    items = []
+    for bucket in buckets:
+        issues = _scan_bucket_issues(bucket)
+        if issues:
+            item = _bucket_to_api(bucket)
+            item["issues"] = issues
+            items.append(item)
+    items.sort(key=lambda x: (len(x["issues"]), x.get("importance", 0)), reverse=True)
+    return JSONResponse({"total": len(buckets), "issue_count": len(items), "items": items})
+
+
+@mcp.custom_route("/api/maintenance/normalize", methods=["POST"])
+async def api_maintenance_normalize(request):
+    """Normalize safe metadata fields without touching content."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    changed = []
+    for bucket in buckets:
+        meta = bucket.get("metadata", {})
+        updates = {}
+        if not meta.get("name"):
+            updates["name"] = bucket["id"]
+        if not isinstance(meta.get("domain", []), list):
+            updates["domain"] = _safe_list(meta.get("domain")) or ["未分类"]
+        if not isinstance(meta.get("tags", []), list):
+            updates["tags"] = _safe_list(meta.get("tags"))
+        imp = _clamp_int(meta.get("importance", 5), 5)
+        if imp != meta.get("importance"):
+            updates["importance"] = imp
+        if not meta.get("created"):
+            updates["created"] = now_iso()
+        if not meta.get("last_active"):
+            updates["last_active"] = meta.get("created") or now_iso()
+        if meta.get("pinned") and meta.get("type") != "permanent":
+            updates["type"] = "permanent"
+            updates["importance"] = 10
+            updates["pinned"] = True
+        if meta.get("pinned") and imp != 10:
+            updates["pinned"] = True
+            updates["importance"] = 10
+        if meta.get("type") == "permanent" and not meta.get("pinned"):
+            updates["type"] = "dynamic"
+        if updates:
+            ok = await bucket_mgr.update(bucket["id"], **updates)
+            if ok:
+                changed.append({"id": bucket["id"], "updated": list(updates.keys())})
+    return JSONResponse({"ok": True, "changed": changed, "count": len(changed)})
 
 
 @mcp.custom_route("/api/search", methods=["GET"])

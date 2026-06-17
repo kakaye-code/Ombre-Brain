@@ -29,14 +29,14 @@ import os
 import math
 import logging
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import frontmatter
 from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
+from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, parse_iso_datetime
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -58,6 +58,7 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.trash_dir = os.path.join(self.base_dir, "trash")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
@@ -272,6 +273,10 @@ class BucketManager:
             post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
         if "name" in kwargs:
             post["name"] = sanitize_name(kwargs["name"])
+        if "type" in kwargs:
+            target_type = str(kwargs["type"]).strip()
+            if target_type in ("dynamic", "permanent", "archived", "feel"):
+                post["type"] = target_type
         if "resolved" in kwargs:
             post["resolved"] = bool(kwargs["resolved"])
         if "pinned" in kwargs:
@@ -282,9 +287,14 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "created" in kwargs:
+            post["created"] = str(kwargs["created"])
+        if "last_active" in kwargs:
+            post["last_active"] = str(kwargs["last_active"])
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
-        post["last_active"] = now_iso()
+        if "last_active" not in kwargs:
+            post["last_active"] = now_iso()
 
         try:
             with open(file_path, "w", encoding="utf-8") as f:
@@ -299,11 +309,25 @@ class BucketManager:
         # They stay in dynamic/ and decay naturally until score < threshold.
         # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
         domain = post.get("domain", ["未分类"])
+        target_dir = None
         if kwargs.get("pinned") and post.get("type") != "permanent":
             post["type"] = "permanent"
+            target_dir = self.permanent_dir
+        elif kwargs.get("pinned") is False and post.get("type") == "permanent":
+            post["type"] = "dynamic"
+            target_dir = self.dynamic_dir
+        elif "type" in kwargs:
+            target_dir = {
+                "dynamic": self.dynamic_dir,
+                "permanent": self.permanent_dir,
+                "archived": self.archive_dir,
+                "feel": self.feel_dir,
+            }.get(post.get("type"))
+
+        if target_dir:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.permanent_dir, domain)
+            self._move_bucket(file_path, target_dir, domain)
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -368,7 +392,7 @@ class BucketManager:
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
-            current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
+            current_time = parse_iso_datetime(post.get("created", post.get("last_active", "")))
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
@@ -398,7 +422,7 @@ class BucketManager:
 
             created_str = meta.get("created", meta.get("last_active", ""))
             try:
-                created = datetime.fromisoformat(str(created_str))
+                created = parse_iso_datetime(created_str)
                 delta_hours = abs((reference_time - created).total_seconds()) / 3600
             except (ValueError, TypeError):
                 continue
@@ -610,8 +634,8 @@ class BucketManager:
         """
         last_active_str = meta.get("last_active", meta.get("created", ""))
         try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
+            last_active = parse_iso_datetime(last_active_str)
+            days = max(0.0, (datetime.now(timezone.utc) - last_active).total_seconds() / 86400)
         except (ValueError, TypeError):
             days = 30
         return math.exp(-0.02 * days)

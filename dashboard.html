@@ -299,6 +299,27 @@
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
 
+  .edit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .edit-field label { display:block; font-size:11px; color:var(--text-light); margin-bottom:4px; text-transform:uppercase; letter-spacing:.4px; }
+  .edit-field input, .edit-field select, .edit-field textarea {
+    width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text);
+    padding:9px 11px; border-radius:10px; font-family:inherit; font-size:13px;
+    box-shadow: inset 2px 2px 4px var(--shadow-dark-subtle), inset -2px -2px 4px var(--shadow-light);
+  }
+  .edit-field textarea { min-height:220px; resize:vertical; line-height:1.6; }
+  .edit-actions { display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 18px; }
+  .btn-secondary, .btn-danger {
+    padding:10px 18px; border-radius:20px; font-family:inherit; font-size:12px; cursor:pointer;
+    background:var(--surface); border:1px solid var(--border); color:var(--text-dim);
+  }
+  .btn-danger { color:var(--negative); border-color:rgba(139,74,74,.45); }
+  .maintenance-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  .maintenance-list { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+  .maintenance-row { padding:12px 14px; border:1px solid var(--border); border-radius:12px; background:var(--surface); font-size:12px; }
+  .maintenance-row b { color:var(--accent); }
+  .maintenance-row code { font-size:11px; color:var(--text-dim); }
+  .maintenance-status { margin-top:12px; font-size:13px; color:var(--text-dim); }
+
   .config-section {
     margin-bottom: 28px;
     padding: 24px;
@@ -616,6 +637,7 @@
   <div class="tab" data-tab="network">记忆网络</div>
   <div class="tab" data-tab="config">配置</div>
   <div class="tab" data-tab="import">导入</div>
+  <div class="tab" data-tab="maintenance">Maintenance</div>
   <div class="tab" data-tab="settings">设置</div>
 </div>
 
@@ -771,6 +793,27 @@
     <div class="config-section" style="margin-top:28px;">
       <h3>系统信息</h3>
       <div id="config-readonly" style="font-size:13px;color:var(--text-dim);line-height:1.8;">加载中…</div>
+    </div>
+  </div>
+</div>
+
+<div class="content" id="maintenance-view" style="display:none">
+  <div class="maintenance-grid">
+    <div class="config-section">
+      <h3>Metadata Scan</h3>
+      <p style="color:var(--text-dim);font-size:13px;">Find suspicious buckets: invalid importance, pinned/type mismatch, missing names, malformed tags/domains.</p>
+      <div style="display:flex;gap:10px;margin-top:14px;">
+        <button class="btn-primary" onclick="loadMaintenance()">Scan</button>
+        <button class="btn-secondary" onclick="normalizeMaintenance()">Normalize safe fields</button>
+      </div>
+      <div id="maintenance-status" class="maintenance-status">Not scanned yet.</div>
+      <div id="maintenance-results" class="maintenance-list"></div>
+    </div>
+    <div class="config-section">
+      <h3>Trash</h3>
+      <p style="color:var(--text-dim);font-size:13px;">Soft-deleted buckets are moved to <code>buckets/trash</code>. They do not surface in breath.</p>
+      <button class="btn-secondary" onclick="loadTrash()" style="margin-top:14px;">Refresh trash</button>
+      <div id="trash-results" class="maintenance-list"></div>
     </div>
   </div>
 </div>
@@ -1047,10 +1090,12 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
+    document.getElementById('maintenance-view').style.display = target === 'maintenance' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
     if (target === 'network') loadNetwork();
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
+    if (target === 'maintenance') { loadMaintenance(); loadTrash(); }
     if (target === 'settings') loadSettingsStatus();
   });
 });
@@ -1169,40 +1214,109 @@ async function searchBuckets(query) {
 async function showDetail(id) {
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
-  content.innerHTML = '<div class="loading">加载中…</div>';
+  content.innerHTML = '<div class="loading">Loading...</div>';
   panel.classList.add('open');
 
   try {
     var res = await fetch(BASE + '/api/bucket/' + id);
     var b = await res.json();
+    if (!res.ok) throw new Error(b.error || ('HTTP ' + res.status));
     var meta = b.metadata || {};
+    var domainText = (meta.domain || []).join(', ');
+    var tagsText = (meta.tags || []).join(', ');
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + '</h2>' +
       '<div class="detail-meta">' +
-        '<div class="field"><label>ID</label>' + id + '</div>' +
-        '<div class="field"><label>类型</label>' + (meta.type || 'dynamic') + '</div>' +
-        '<div class="field"><label>域</label>' + (meta.domain || []).join(', ') + '</div>' +
-        '<div class="field"><label>标签</label>' + (meta.tags || []).join(', ') + '</div>' +
-        '<div class="field"><label>事件效价</label>V' + (meta.valence || 0.5).toFixed(2) + '</div>' +
-        '<div class="field"><label>唤醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
-        '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
-        '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
-        '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
-        '<div class="field"><label>激活次数</label>' + (meta.activation_count || 1) + '</div>' +
-        '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>钉选</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
-        '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
+        '<div class="field"><label>ID</label><code>' + id + '</code></div>' +
+        '<div class="field"><label>Score</label>' + Number(b.score || 0).toFixed(4) + '</div>' +
+        '<div class="field"><label>Created</label>' + esc(meta.created || '-') + '</div>' +
+        '<div class="field"><label>Last active</label>' + esc(meta.last_active || '-') + '</div>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+      '<div class="edit-grid">' +
+        '<div class="edit-field"><label>Name</label><input id="edit-name" value="' + esc(meta.name || id) + '"></div>' +
+        '<div class="edit-field"><label>Type</label><select id="edit-type">' +
+          optionHtml('dynamic', meta.type) + optionHtml('permanent', meta.type) + optionHtml('archived', meta.type) + optionHtml('feel', meta.type) +
+        '</select></div>' +
+        '<div class="edit-field"><label>Importance 1-10</label><input id="edit-importance" type="number" min="1" max="10" value="' + esc(String(meta.importance || 5)) + '"></div>' +
+        '<div class="edit-field"><label>Valence 0-1</label><input id="edit-valence" type="number" min="0" max="1" step="0.01" value="' + esc(String(meta.valence || 0.5)) + '"></div>' +
+        '<div class="edit-field"><label>Arousal 0-1</label><input id="edit-arousal" type="number" min="0" max="1" step="0.01" value="' + esc(String(meta.arousal || 0.3)) + '"></div>' +
+        '<div class="edit-field"><label>Domain comma-separated</label><input id="edit-domain" value="' + esc(domainText) + '"></div>' +
+        '<div class="edit-field" style="grid-column:1 / -1"><label>Tags comma-separated</label><input id="edit-tags" value="' + esc(tagsText) + '"></div>' +
+        '<div class="edit-field"><label>Pinned</label><select id="edit-pinned">' + boolOptions(meta.pinned) + '</select></div>' +
+        '<div class="edit-field"><label>Resolved</label><select id="edit-resolved">' + boolOptions(meta.resolved) + '</select></div>' +
+        '<div class="edit-field"><label>Digested</label><select id="edit-digested">' + boolOptions(meta.digested) + '</select></div>' +
+        '<div class="edit-field" style="grid-column:1 / -1"><label>Content</label><textarea id="edit-content">' + esc(b.content || '') + '</textarea></div>' +
+      '</div>' +
+      '<div class="edit-actions">' +
+        '<button class="btn-primary" onclick="saveBucket(\'' + id + '\')">Save changes</button>' +
+        '<button class="btn-secondary" onclick="showDetail(\'' + id + '\')">Reload</button>' +
+        '<button class="btn-danger" onclick="trashBucket(\'' + id + '\')">Move to trash</button>' +
+      '</div>' +
+      '<div id="detail-status" style="font-size:13px;color:var(--text-dim);"></div>';
   } catch (e) {
-    content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+    content.innerHTML = '<div class="loading">Load failed: ' + esc(e.message) + '</div>';
   }
 }
 
 function closeDetail() {
   document.getElementById('detail-panel').classList.remove('open');
+}
+
+function optionHtml(value, selected) {
+  return '<option value="' + value + '"' + (value === selected ? ' selected' : '') + '>' + value + '</option>';
+}
+
+function boolOptions(value) {
+  return '<option value="false"' + (!value ? ' selected' : '') + '>false</option>' +
+    '<option value="true"' + (value ? ' selected' : '') + '>true</option>';
+}
+
+async function saveBucket(id) {
+  var status = document.getElementById('detail-status');
+  var body = {
+    name: document.getElementById('edit-name').value,
+    type: document.getElementById('edit-type').value,
+    importance: parseInt(document.getElementById('edit-importance').value) || 5,
+    valence: parseFloat(document.getElementById('edit-valence').value),
+    arousal: parseFloat(document.getElementById('edit-arousal').value),
+    domain: document.getElementById('edit-domain').value,
+    tags: document.getElementById('edit-tags').value,
+    pinned: document.getElementById('edit-pinned').value === 'true',
+    resolved: document.getElementById('edit-resolved').value === 'true',
+    digested: document.getElementById('edit-digested').value === 'true',
+    content: document.getElementById('edit-content').value,
+  };
+  status.textContent = 'Saving...';
+  try {
+    var res = await authFetch(BASE + '/api/bucket/' + id, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    var result = await res.json();
+    if (!res.ok || !result.ok) throw new Error(result.error || ('HTTP ' + res.status));
+    status.innerHTML = '<span style="color:var(--positive)">Saved: ' + result.updated.join(', ') + '</span>';
+    await loadBuckets();
+    setTimeout(function() { showDetail(id); }, 250);
+  } catch (e) {
+    status.innerHTML = '<span style="color:var(--negative)">Save failed: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function trashBucket(id) {
+  if (!confirm('Move this bucket to trash?')) return;
+  var status = document.getElementById('detail-status');
+  status.textContent = 'Moving to trash...';
+  try {
+    var res = await authFetch(BASE + '/api/bucket/' + id + '/trash', { method: 'POST' });
+    var result = await res.json();
+    if (!res.ok || !result.ok) throw new Error(result.error || ('HTTP ' + res.status));
+    closeDetail();
+    await loadBuckets();
+    await loadTrash();
+  } catch (e) {
+    status.innerHTML = '<span style="color:var(--negative)">Trash failed: ' + esc(e.message) + '</span>';
+  }
 }
 
 var networkData = null;
@@ -1494,6 +1608,86 @@ async function saveConfig(persist) {
     }
   } catch (e) {
     status.innerHTML = '<span style="color:var(--negative)">✗ 请求失败: ' + e.message + '</span>';
+  }
+}
+
+async function loadMaintenance() {
+  var status = document.getElementById('maintenance-status');
+  var list = document.getElementById('maintenance-results');
+  status.textContent = 'Scanning...';
+  list.innerHTML = '';
+  try {
+    var res = await authFetch(BASE + '/api/maintenance/scan');
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    status.textContent = data.issue_count + ' suspicious buckets / ' + data.total + ' total';
+    if (!data.items.length) {
+      list.innerHTML = '<div class="maintenance-row">No metadata issues found.</div>';
+      return;
+    }
+    list.innerHTML = data.items.map(function(b) {
+      return '<div class="maintenance-row">' +
+        '<b>' + esc(b.name || b.id) + '</b><br>' +
+        '<code>' + b.id + '</code><br>' +
+        'issues: ' + esc((b.issues || []).join(', ')) + '<br>' +
+        'type=' + esc(b.type) + ' imp=' + esc(String(b.importance)) + ' pinned=' + esc(String(b.pinned)) +
+        '<div style="margin-top:8px;"><button class="btn-secondary" onclick="showDetail(\'' + b.id + '\')">Edit</button></div>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    status.innerHTML = '<span style="color:var(--negative)">Scan failed: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function normalizeMaintenance() {
+  if (!confirm('Normalize safe metadata fields? Content will not be changed.')) return;
+  var status = document.getElementById('maintenance-status');
+  status.textContent = 'Normalizing...';
+  try {
+    var res = await authFetch(BASE + '/api/maintenance/normalize', { method: 'POST' });
+    var data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    status.innerHTML = '<span style="color:var(--positive)">Normalized ' + data.count + ' buckets.</span>';
+    await loadBuckets();
+    await loadMaintenance();
+  } catch (e) {
+    status.innerHTML = '<span style="color:var(--negative)">Normalize failed: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function loadTrash() {
+  var list = document.getElementById('trash-results');
+  list.innerHTML = '<div class="maintenance-row">Loading...</div>';
+  try {
+    var res = await authFetch(BASE + '/api/trash');
+    var data = await res.json();
+    if (!res.ok || !Array.isArray(data)) throw new Error(data.error || ('HTTP ' + res.status));
+    if (!data.length) {
+      list.innerHTML = '<div class="maintenance-row">Trash is empty.</div>';
+      return;
+    }
+    list.innerHTML = data.map(function(b) {
+      return '<div class="maintenance-row">' +
+        '<b>' + esc(b.name || b.id) + '</b><br>' +
+        '<code>' + b.id + '</code><br>' +
+        'deleted_at=' + esc(b.deleted_at || b.last_active || '-') +
+        '<div style="margin-top:8px;"><button class="btn-secondary" onclick="restoreBucket(\'' + b.id + '\')">Restore</button></div>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div class="maintenance-row" style="color:var(--negative)">Trash load failed: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function restoreBucket(id) {
+  try {
+    var res = await authFetch(BASE + '/api/trash/' + id + '/restore', { method: 'POST' });
+    var data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    await loadTrash();
+    await loadBuckets();
+  } catch (e) {
+    alert('Restore failed: ' + e.message);
   }
 }
 

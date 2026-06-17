@@ -15,7 +15,7 @@ import uuid
 import yaml
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def load_config(config_path: str = None) -> dict:
@@ -229,4 +229,22 @@ def now_iso() -> str:
     Return current time as ISO format string.
     返回当前时间的 ISO 格式字符串。
     """
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_iso_datetime(value) -> datetime:
+    """
+    Parse old naive timestamps and new UTC timestamps into timezone-aware UTC datetimes.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return datetime.now(timezone.utc)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
